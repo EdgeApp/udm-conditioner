@@ -7,7 +7,7 @@ network passes through the kernel here, where tc can condition it. Traffic withi
 switched in hardware and never arrives, which is why devices under test live on their own
 VLANs.
 
-Only the Python standard library is used: the UDM ships Python 3.9 but no Node and no pip.
+Only the Python standard library is used: the UDM ships Python 3 but no Node and no pip.
 
 The kernel has no cls_flower and no cls_matchall, so where the Pi build used those this uses
 cls_basic with no match for the catch-all hooks, and u32 `match ip dst|src` for the per-device
@@ -26,7 +26,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PORT = int(os.environ.get("COND_PORT", "10443"))
 HOST = os.environ.get("COND_HOST", "0.0.0.0")
 CERT = os.environ.get("COND_CERT", "/persistent/udm-conditioner/cert.pem")
@@ -53,6 +53,10 @@ TARGET_BUFFER_SEC = 0.15
 FILTER_PRIO_BASE = 10
 MODULES = ["sch_netem", "sch_htb", "ifb", "act_mirred", "cls_u32", "cls_basic", "sch_ingress"]
 HISTORY_MAX = 500
+# The active shapes, rewritten on every change so a restart of the service puts them back: the
+# stop tears every hook and IFB down, and other agents' devices must not come back unshaped.
+# /run is a tmpfs, so a reboot still starts clean.
+STATE = os.environ.get("COND_STATE", "/run/udm-conditioner/shapes.json")
 LEASES = "/run/dnsmasq.lease"
 # tc -force keeps going past these, which are expected when clearing a slot that has no filter.
 # This tc reports one such delete as three lines: the error, "We have an error talking to the
@@ -156,65 +160,63 @@ def uncapped_slot_lines(dev, slot):
     ]
 
 
-def devices_for(direction):
-    """The IFBs a shape applies to. Downstream carries traffic toward the device, upstream from it."""
-    return {
-        "both": (DEV_DOWN, DEV_UP),
-        "down": (DEV_DOWN,),
-        "up": (DEV_UP,),
-    }[direction]
+# Each slot has a class on both IFBs. Downstream carries traffic toward the device, upstream
+# traffic from it, and each side of a slot is shaped independently.
+SIDES = (("down", DEV_DOWN), ("up", DEV_UP))
 
 
-def filter_lines(slot, ip, direction="both"):
-    """Per-device filters. Downstream is traffic toward the device, upstream is from it.
+def sides_for(direction):
+    """The sides a request entry sets."""
+    return {"both": ("down", "up"), "down": ("down",), "up": ("up",)}[direction]
 
-    A direction the shape does not cover loses its filter, so that traffic is classified into the
-    default and passes unshaped — rather than being matched into a slot that is merely uncapped.
+
+def filter_lines(dev, slot, ip):
+    """Point one IFB's per-device filter for a slot at `ip`, or remove it when `ip` is None.
+
+    A side with no shape has no filter, so that traffic is classified into the default and
+    passes unshaped - rather than being matched into a slot that is merely uncapped.
     """
     prio = filter_prio(slot)
-    wanted = devices_for(direction)
-    lines = []
-    for dev, match in ((DEV_DOWN, f"dst {ip}/32"), (DEV_UP, f"src {ip}/32")):
-        lines.append(f"filter delete dev {dev} parent 1: prio {prio}")
-        if dev in wanted:
-            lines.append(
-                f"filter add dev {dev} parent 1: protocol ip prio {prio} u32 match ip {match} flowid {class_id(slot)}"
-            )
+    lines = [f"filter delete dev {dev} parent 1: prio {prio}"]
+    if ip is not None:
+        match = f"dst {ip}/32" if dev == DEV_DOWN else f"src {ip}/32"
+        lines.append(f"filter add dev {dev} parent 1: protocol ip prio {prio} u32 match ip {match} flowid {class_id(slot)}")
     return lines
 
 
-def build_batch(plans, previous_ip_by_slot):
+def side_lines(dev, slot, params):
+    b = burst_bytes(params["rateKbit"])
+    return [
+        f"class change dev {dev} parent 1: classid {class_id(slot)} htb rate {params['rateKbit']}kbit "
+        f"ceil {params['rateKbit']}kbit burst {b}b cburst {b}b quantum {quantum_bytes(params['rateKbit'])}",
+        f"qdisc change dev {dev} parent {class_id(slot)} handle {netem_handle(slot)} netem {netem_args(params)}",
+    ]
+
+
+def build_batch(plans, previous):
     """tc batch moving the live configuration to `plans`.
 
-    A slot whose device is unchanged keeps its filter, so reapplying a shape never
-    interrupts classification. Slots no longer wanted lose their filter and are reset.
+    `previous` maps each slot in use to the IP its filter on each side points at:
+    {slot: {"down": ip or None, "up": ip or None}}. A side whose filter is unchanged keeps it, so
+    reapplying a shape never interrupts classification. Slots no longer wanted lose their filters
+    and are reset.
     """
     lines = []
     wanted = {p["slot"] for p in plans}
     for p in plans:
-        b = burst_bytes(p["rateKbit"])
-        direction = p.get("direction", "both")
-        shaped = devices_for(direction)
-        for dev in (DEV_DOWN, DEV_UP):
-            if dev in shaped:
-                lines.append(
-                    f"class change dev {dev} parent 1: classid {class_id(p['slot'])} htb rate {p['rateKbit']}kbit "
-                    f"ceil {p['rateKbit']}kbit burst {b}b cburst {b}b quantum {quantum_bytes(p['rateKbit'])}"
-                )
-                lines.append(f"qdisc change dev {dev} parent {class_id(p['slot'])} handle {netem_handle(p['slot'])} netem {netem_args(p)}")
-            else:
-                # The slot keeps no cap on the side this shape leaves alone, so a slot reused with a
-                # narrower direction cannot carry the previous one's rate.
-                lines += uncapped_slot_lines(dev, p["slot"])
-        if previous_ip_by_slot.get(p["slot"]) != (p["ip"], direction):
-            lines += filter_lines(p["slot"], p["ip"], direction)
-    for slot in previous_ip_by_slot:
+        slot = p["slot"]
+        for side, dev in SIDES:
+            params = p[side]
+            # A side left unshaped keeps no cap, so a reused slot cannot carry the previous rate.
+            lines += side_lines(dev, slot, params) if params else uncapped_slot_lines(dev, slot)
+            target = p["ip"] if params else None
+            if previous.get(slot, {}).get(side) != target:
+                lines += filter_lines(dev, slot, target)
+    for slot in previous:
         if slot in wanted:
             continue
-        prio = filter_prio(slot)
-        lines.append(f"filter delete dev {DEV_DOWN} parent 1: prio {prio}")
-        lines.append(f"filter delete dev {DEV_UP} parent 1: prio {prio}")
-        for dev in (DEV_DOWN, DEV_UP):
+        for _side, dev in SIDES:
+            lines += filter_lines(dev, slot, None)
             lines += uncapped_slot_lines(dev, slot)
     return lines
 
@@ -337,13 +339,12 @@ def as_non_negative(raw, field):
 
 
 def as_direction(raw):
-    """Which way a shape applies: from the device, toward it, or both.
+    """Which side of a device's link an entry sets: from the device, toward it, or both.
 
-    A device's link carries what it sends and what it receives, so a cap on its IP squeezes both.
-    That is wrong whenever only one direction is under test — capping a Director's link to squeeze
-    the stream it publishes also starves the cameras feeding it, and what looks like a broken
-    stream is a starved encoder. `both` stays the default, so anything that does not ask is
-    unaffected.
+    A device's link carries what it sends and what it receives, and each side is shaped on its
+    own. `up` or `down` sets that side and, with merge, leaves the other as it was, so a call can
+    squeeze what a Director publishes without starving the cameras feeding it. Different upload
+    and download values take two entries, in one request or two.
     """
     if raw is None:
         return "both"
@@ -352,26 +353,42 @@ def as_direction(raw):
     return raw
 
 
-def as_shape(raw):
+SHAPE_FIELDS = ("ip", "latencyMs", "jitterMs", "mbit", "lossPct", "direction")
+REQUEST_FIELDS = ("shapes", "merge")
+
+
+def reject_unknown(raw, allowed, where):
+    """A misspelled field would otherwise be silently read as its default - zero, which clears."""
+    unknown = [k for k in raw if k not in allowed]
+    if unknown:
+        raise ValueError(f"Unknown field {json.dumps(unknown[0])} in {where}; expected {', '.join(allowed)}")
+
+
+def as_shape(raw, index=0):
     if not isinstance(raw, dict):
         raise ValueError("Expected each shape to be an object")
-    return {
-        "ip": as_ip(raw.get("ip")),
-        "latencyMs": as_non_negative(raw.get("latencyMs", 0), "latencyMs"),
+    reject_unknown(raw, SHAPE_FIELDS, f"shapes[{index}]")
+    mbit = as_non_negative(raw.get("mbit", 0), "mbit")  # 0 or omitted = uncapped
+    params = {
+        "rateKbit": mbit_to_kbit(mbit),
+        "delayMs": as_non_negative(raw.get("latencyMs", 0), "latencyMs"),
         "jitterMs": as_non_negative(raw.get("jitterMs", 0), "jitterMs"),
-        "mbit": as_non_negative(raw.get("mbit", 0), "mbit"),  # 0 or omitted = uncapped
         "lossPct": as_non_negative(raw.get("lossPct", 0), "lossPct"),
-        "direction": as_direction(raw.get("direction", "both")),
     }
+    unshaped = mbit <= 0 and params["delayMs"] <= 0 and params["jitterMs"] <= 0 and params["lossPct"] <= 0
+    # params None means "this side is unshaped": the entry clears the sides it names.
+    return {"ip": as_ip(raw.get("ip")), "direction": as_direction(raw.get("direction", "both")),
+            "params": None if unshaped else params}
 
 
 def as_shape_request(raw):
     if not isinstance(raw, dict) or not isinstance(raw.get("shapes"), list):
         raise ValueError('Expected a body of the form {"shapes": [...]}')
+    reject_unknown(raw, REQUEST_FIELDS, "the request")
     merge = raw.get("merge", False)
     if not isinstance(merge, bool):
         raise ValueError("Expected merge to be a boolean")
-    return [as_shape(s) for s in raw["shapes"]], merge
+    return [as_shape(s, i) for i, s in enumerate(raw["shapes"])], merge
 
 
 # --- shaper ---------------------------------------------------------------------------------
@@ -392,7 +409,7 @@ class Shaper:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.active = {}  # ip -> applied plan
+        self.active = {}  # ip -> {slot, ip, down, up, appliedAtMs}; a side is its params or None
         self.slot_of_ip = {}
         self.subnets = {}  # iface -> network, refreshed by the reconciler
         # Kernel indexes of the IFB pair and of each bridge as it was when hooked. UniFi
@@ -410,46 +427,74 @@ class Shaper:
         build_baseline()
         self.active, self.slot_of_ip = {}, {}
         self.record_indexes()
+        self.save()
 
     def init(self):
         with self.lock:
             self.rebuild()
 
-    def assign_slots(self, shapes):
+    @staticmethod
+    def sides_of(a):
+        return {"down": a["down"], "up": a["up"]}
+
+    def assign_slots(self, desired):
+        """One slot per IP, kept while the IP stays shaped. `desired` maps ip -> sides."""
         warnings, plans = [], []
-        used = {self.slot_of_ip[s["ip"]] for s in shapes if s["ip"] in self.slot_of_ip}
-        for s in shapes:
-            slot = self.slot_of_ip.get(s["ip"])
+        used = {self.slot_of_ip[ip] for ip in desired if ip in self.slot_of_ip}
+        for ip, sides in desired.items():
+            slot = self.slot_of_ip.get(ip)
             if slot is None:
                 slot = next((c for c in range(1, SLOTS + 1) if c not in used), None)
             if slot is None:
-                warnings.append(f"No free slot for {s['ip']}; {SLOTS} shapes is the maximum")
+                warnings.append(f"No free slot for {ip}; {SLOTS} shapes is the maximum")
                 continue
             used.add(slot)
-            plans.append({"slot": slot, "ip": s["ip"], "rateKbit": mbit_to_kbit(s["mbit"]),
-                          "delayMs": s["latencyMs"], "jitterMs": s["jitterMs"], "lossPct": s["lossPct"],
-                          "direction": s["direction"]})
+            plans.append({"slot": slot, "ip": ip, "down": sides["down"], "up": sides["up"]})
         return plans, warnings
 
-    @staticmethod
-    def to_shape(a):
-        return {"ip": a["ip"], "latencyMs": a["delayMs"], "jitterMs": a["jitterMs"],
-                "mbit": 0 if a["rateKbit"] >= UNCAPPED_KBIT else a["rateKbit"] / 1000,
-                "lossPct": a["lossPct"], "direction": a.get("direction", "both")}
+    def previous_filters(self):
+        return {a["slot"]: {side: a["ip"] if a[side] else None for side, _dev in SIDES}
+                for a in self.active.values()}
 
-    @staticmethod
-    def is_unshaped(s):
-        return s["mbit"] <= 0 and s["latencyMs"] <= 0 and s["jitterMs"] <= 0 and s["lossPct"] <= 0
+    def commit(self, plans):
+        now_ms = int(time.time() * 1000)
+        self.active = {p["ip"]: {**p, "appliedAtMs": now_ms} for p in plans}
+        self.slot_of_ip = {p["ip"]: p["slot"] for p in plans}
+        self.save()
+
+    def save(self):
+        """Write the active shapes to STATE. A failure is logged, never fatal: shaping is live
+        either way, and only a later restart would lose it."""
+        try:
+            os.makedirs(os.path.dirname(STATE), exist_ok=True)
+            tmp = f"{STATE}.tmp"
+            with open(tmp, "w") as f:
+                json.dump({"shapes": [{"ip": ip, **self.sides_of(a)} for ip, a in self.active.items()]}, f)
+            os.replace(tmp, STATE)
+        except OSError as e:
+            log(f"could not save shaping state to {STATE}: {e}")
+
+    def restore(self, saved):
+        """Reapply shapes from load_state(), as ip -> sides. Returns how many were applied."""
+        with self.lock:
+            plans, warnings = self.assign_slots(saved)
+            _, err = tc_batch(build_batch(plans, self.previous_filters()))
+            warnings += [l for l in err.strip().splitlines() if l and not BENIGN_TC_ERRORS.search(l)]
+            self.commit(plans)
+            for w in warnings:
+                log(f"restore: {w}")
+            return len(plans)
 
     def quick_repair(self, warnings):
         """Per-call integrity check using kernel indexes only. Caller holds the lock.
 
-        Returns the shapes that were active before a rebuild, so the caller can restore them;
-        anything subtler than a recreated device is left to the reconciler's full check.
+        Returns the sides that were active before a rebuild, as ip -> sides, so the caller can
+        restore them; anything subtler than a recreated device is left to the reconciler's full
+        check.
         """
         if (read_ifindex(DEV_DOWN), read_ifindex(DEV_UP)) != self.ifb_index or None in self.ifb_index:
             warnings.append("Shaping tree was missing and has been rebuilt")
-            previous = [self.to_shape(a) for a in self.active.values()]
+            previous = {ip: self.sides_of(a) for ip, a in self.active.items()}
             self.rebuild()
             return previous
         for iface in IFACES:
@@ -459,48 +504,45 @@ class Shaper:
                 self.hooked_index[iface] = index
                 self.subnets = iface_subnets()
                 warnings.append(f"Re-attached shaping hooks to {iface}")
-        return []
+        return {}
 
     def set_shapes(self, shapes, merge=False):
-        """Declarative by default: the array becomes the complete active set. With merge, only
-        the listed IPs are touched. Either way an entry with no conditioning clears that IP."""
+        """Declarative by default: the entries become the complete active set. With merge, only
+        the sides the entries name are touched. Entries apply in order, each setting the sides
+        its direction names; an entry with no conditioning clears those sides. An IP with
+        neither side shaped is cleared."""
         with self.lock:
             started = time.perf_counter()
             warnings = []
             restored = self.quick_repair(warnings)
+            before = set(self.active) | set(restored)
 
             # With merge, everything already in force stays - including shapes that a rebuild
             # just wiped and quick_repair handed back. Without it, the request is the whole set.
             desired = {}
             if merge:
-                desired = {s["ip"]: s for s in restored}
-                desired.update({a["ip"]: self.to_shape(a) for a in self.active.values()})
-            cleared = []
+                desired = {ip: dict(sides) for ip, sides in restored.items()}
+                desired.update({ip: self.sides_of(a) for ip, a in self.active.items()})
             for s in shapes:
-                if self.is_unshaped(s):
-                    if desired.pop(s["ip"], None) is not None or s["ip"] in self.active:
-                        cleared.append(s["ip"])
-                    continue
-                desired[s["ip"]] = s
-            if not merge:
-                cleared += [ip for ip in self.active if ip not in desired and ip not in cleared]
+                sides = desired.setdefault(s["ip"], {"down": None, "up": None})
+                for side in sides_for(s["direction"]):
+                    sides[side] = s["params"]
+            desired = {ip: sides for ip, sides in desired.items() if sides["down"] or sides["up"]}
+            cleared = [ip for ip in before if ip not in desired]
 
             for ip in desired:
                 if not any(ipaddress.ip_address(ip) in n for n in self.subnets.values()):
                     where = ", ".join(f"{i} {n}" for i, n in self.subnets.items()) or "none present"
                     warnings.append(f"{ip} is not on a shaped network ({where}); its traffic never reaches the shaper")
 
-            plans, slot_warnings = self.assign_slots(list(desired.values()))
+            plans, slot_warnings = self.assign_slots(desired)
             warnings += slot_warnings
-            previous = {a["slot"]: (a["ip"], a.get("direction", "both")) for a in self.active.values()}
-            batch = build_batch(plans, previous)
+            batch = build_batch(plans, self.previous_filters())
             tc_ms, err = tc_batch(batch)
             warnings += [l for l in err.strip().splitlines() if l and not BENIGN_TC_ERRORS.search(l)]
 
-            now_ms = int(time.time() * 1000)
-            self.active = {p["ip"]: {**p, "appliedAtMs": now_ms} for p in plans}
-            self.slot_of_ip = {p["ip"]: p["slot"] for p in plans}
-            return {"applied": list(self.active.values()), "cleared": cleared,
+            self.commit(plans)
+            return {"applied": list(self.active.values()), "cleared": sorted(cleared),
                     "applyDurationMs": (time.perf_counter() - started) * 1000,
                     "tcDurationMs": tc_ms, "commands": batch, "warnings": warnings}
 
@@ -513,7 +555,7 @@ class Shaper:
             self.rebuild()
 
     def list(self):
-        return list(self.active.values())
+        return [{**applied_view(a), "appliedAtMs": a["appliedAtMs"]} for a in self.active.values()]
 
     def interfaces(self):
         present = set(present_ifaces())
@@ -540,18 +582,46 @@ class Shaper:
                             log(f"reconciler: re-attached shaping hooks to {iface}")
                         continue
                     log("reconciler: shaping tree missing, rebuilding")
-                    previous = [self.to_shape(a) for a in self.active.values()]
+                    previous = {ip: self.sides_of(a) for ip, a in self.active.items()}
                     self.rebuild()
                     if previous:
                         plans, _ = self.assign_slots(previous)
                         _, err = tc_batch(build_batch(plans, {}))
                         if not [l for l in err.strip().splitlines() if l and not BENIGN_TC_ERRORS.search(l)]:
-                            now_ms = int(time.time() * 1000)
-                            self.active = {p["ip"]: {**p, "appliedAtMs": now_ms} for p in plans}
-                            self.slot_of_ip = {p["ip"]: p["slot"] for p in plans}
+                            self.commit(plans)
                         log(f"reconciler: reapplied {len(plans)} shape(s)")
             except Exception as e:  # keep reconciling whatever happened this round
                 log(f"reconciler failed: {e}")
+
+
+def load_state():
+    """The shapes STATE recorded, as ip -> sides, or {} when there is none or it is unreadable."""
+    try:
+        with open(STATE) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        log(f"ignoring unreadable shaping state {STATE}: {e}")
+        return {}
+    saved = {}
+    try:
+        for entry in raw["shapes"]:
+            sides = {}
+            for side, _dev in SIDES:
+                params = entry.get(side)
+                sides[side] = None if not params else {
+                    "rateKbit": int(params["rateKbit"]),
+                    "delayMs": as_non_negative(params["delayMs"], "delayMs"),
+                    "jitterMs": as_non_negative(params["jitterMs"], "jitterMs"),
+                    "lossPct": as_non_negative(params["lossPct"], "lossPct"),
+                }
+            if sides["down"] or sides["up"]:
+                saved[as_ip(entry["ip"])] = sides
+    except (KeyError, TypeError, ValueError) as e:
+        log(f"ignoring malformed shaping state {STATE}: {e}")
+        return {}
+    return saved
 
 
 # --- devices --------------------------------------------------------------------------------
@@ -606,10 +676,19 @@ history = []
 history_lock = threading.Lock()
 
 
+def side_view(params):
+    if not params:
+        return None
+    return {"latencyMs": params["delayMs"], "jitterMs": params["jitterMs"],
+            "mbit": None if params["rateKbit"] >= UNCAPPED_KBIT else params["rateKbit"] / 1000,
+            "lossPct": params["lossPct"]}
+
+
 def applied_view(a):
-    return {"ip": a["ip"], "latencyMs": a["delayMs"], "jitterMs": a["jitterMs"],
-            "mbit": None if a["rateKbit"] >= UNCAPPED_KBIT else a["rateKbit"] / 1000,
-            "lossPct": a["lossPct"], "slot": a["slot"], "expectedRttDeltaMs": a["delayMs"] * 2}
+    """One device's shaping, per side. A side that is null passes unshaped."""
+    delay = sum(a[side]["delayMs"] for side, _dev in SIDES if a[side])
+    return {"ip": a["ip"], "slot": a["slot"], "down": side_view(a["down"]), "up": side_view(a["up"]),
+            "expectedRttDeltaMs": delay}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -775,7 +854,10 @@ def main():
         sys.exit("Set COND_IFACES to the test VLAN bridges, for example br10:test-a,br20:test-b.")
     if "br0" in IFACES:
         sys.exit("Refusing to shape br0: that is the main LAN. Shape only the test VLANs' bridges.")
+    saved = load_state()  # read before init, which rebuilds the tree and records it empty
     shaper.init()
+    if saved:
+        log(f"restored {shaper.restore(saved)} shape(s) from {STATE}")
     threading.Thread(target=shaper.reconcile_forever, daemon=True).start()
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(CERT, KEY)

@@ -43,6 +43,9 @@ across the networks through the UDM's mDNS proxy.
   compares kernel interface indexes (a file read, no `tc`) and re-attaches a recreated bridge;
   a full check with `tc` runs every 5 s.
 - Stopping the service removes its hooks and IFB devices, leaving the gateway as it found it.
+  The active shapes are saved in `/run/udm-conditioner/shapes.json` and reapplied when it starts
+  again, so a restart or an update does not unshape devices other agents are testing. A reboot
+  clears `/run` and starts with nothing shaped.
 
 Install or update by copying `udm/` to `/persistent/udm-conditioner` on the gateway, then
 running `sh /persistent/udm-conditioner/install.sh` there. Before the first start, set
@@ -51,6 +54,12 @@ running `sh /persistent/udm-conditioner/install.sh` there. Before the first star
 Everything lives in `/persistent/udm-conditioner`, which survives firmware updates. The systemd
 unit is copied into `/etc`, which a firmware update may reset. Afterwards, run
 `sh /persistent/udm-conditioner/install.sh` on the gateway.
+
+Tests run the shaper against a fake `tc`, with no gateway needed:
+
+```sh
+python3 -m unittest discover -s tests
+```
 
 ## Pi build design (retired)
 
