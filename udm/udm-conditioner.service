@@ -1,0 +1,19 @@
+[Unit]
+Description=udm-conditioner - per-device network conditioning on the test VLANs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Test VLAN bridges to shape. Never br0. The optional :label is the name clients see.
+# Replace the example with the bridges on this gateway before starting the service.
+Environment=COND_IFACES=br10:test-a,br20:test-b
+Environment=COND_PORT=10443
+ExecStart=/usr/bin/python3 -u /persistent/udm-conditioner/udm_conditioner.py
+# A stopped conditioner leaves nothing behind on the gateway: no hooks, no IFB devices.
+ExecStopPost=/usr/bin/python3 /persistent/udm-conditioner/udm_conditioner.py --teardown
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

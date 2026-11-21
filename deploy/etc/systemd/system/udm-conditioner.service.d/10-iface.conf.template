@@ -1,0 +1,2 @@
+[Service]
+Environment=GSC_IFACE=@@AP1_IFACE@@,@@AP2_IFACE@@

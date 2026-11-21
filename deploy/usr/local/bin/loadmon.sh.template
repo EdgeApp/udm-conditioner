@@ -1,0 +1,14 @@
+#!/bin/bash
+IF=@@AP1_IFACE@@
+OUT=/tmp/loadmon.txt
+: > $OUT
+ERR0=$(journalctl -k -b 0 --no-pager | grep -ciE "timeout|WM Firmware Version|end trace")
+for i in $(seq 1 75); do
+  V=$(vcgencmd pmic_read_adc 2>/dev/null | grep -oE "EXT5V_V volt\([0-9]+\)=[0-9.]+" | grep -oE "[0-9.]+V?$" | tr -d V)
+  T=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2)
+  ERR=$(journalctl -k -b 0 --no-pager | grep -ciE "timeout|WM Firmware Version|end trace")
+  RATES=$(iw dev $IF station dump 2>/dev/null | grep "tx bitrate" | awk "{printf \"%s \", \$3}")
+  TX=$(cat /sys/class/net/$IF/statistics/tx_bytes)
+  echo "$(date +%H:%M:%S) v=$V thr=$T newerr=$((ERR-ERR0)) tx=$TX rates=[$RATES]" >> $OUT
+  sleep 2
+done

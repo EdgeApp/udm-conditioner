@@ -1,0 +1,9 @@
+node_modules/
+lib/
+*.log
+__pycache__/
+*.pyc
+.DS_Store
+
+# deploy secrets, never commit
+deploy/secrets.env

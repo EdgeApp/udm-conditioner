@@ -1,0 +1,106 @@
+#!/bin/bash
+# Recover each AP radio from two distinct mt7921u failure modes.
+#
+# 1. MAC reset: the USB adapter loses firmware comms, the driver runs
+#    mt7921_mac_reset_work, and the radio comes back degraded. Needs a hostapd
+#    restart.
+#
+# 2. Rate-control collapse on a single station: AP->client PHY drops to the
+#    6 Mbit floor while signal and ACKs stay healthy and tx failed stays at 0.
+#    Traffic still flows, so nothing errors - the client just becomes too slow
+#    to carry a video stream. Deauthenticating that one station resets its rate
+#    control without disturbing anyone else, which matters when the other
+#    stations are cameras mid-stream.
+#
+# Each radio runs its own hostapd@<iface> instance, so every recovery below is
+# confined to the radio that needs it. A radio that is unplugged is skipped:
+# its hostapd@ instance is bound to the device and restarts by itself when the
+# radio comes back.
+IFACES="@@AP1_IFACE@@ @@AP2_IFACE@@"
+RUNDIR=/run/ap-watchdog
+mkdir -p "$RUNDIR"
+now=$(date +%s)
+MIN_RX_MBPS_X100=100   # 1.00 Mbps AP->client demand before a tx collapse can matter
+
+for IF in $IFACES; do
+  [ -e "/sys/class/net/$IF" ] || continue
+
+  # --- mode 1: MAC reset -> restart this radio's hostapd (5 min cooldown) ---
+  # Match only this radio's own firmware reload, identified by its USB device
+  # path. Every MT7921 prints the same "WM Firmware Version" line when its
+  # firmware loads, so an unscoped match would restart one AP whenever the
+  # other radio was plugged in, reset or brought up.
+  #
+  # A firmware load is also a normal part of a radio appearing - at boot, or
+  # when it is plugged in - and hostapd@ starts after it in that case. So only a
+  # reload under an AP that was already running counts as a fault; otherwise
+  # every boot and every plug-in would cost an extra restart a minute later.
+  # Both timestamps are monotonic microseconds since boot.
+  STAMP="$RUNDIR/$IF.hostapd.last"
+  DEV=$(basename "$(readlink -f /sys/class/net/$IF/device 2>/dev/null)")
+  if [ ! -f "$STAMP" ] || [ $(( now - $(cat "$STAMP") )) -ge 300 ]; then
+    fw=$(journalctl -k --since "3 min ago" --no-pager -o short-monotonic 2>/dev/null \
+      | grep "mt7921u $DEV: WM Firmware Version" | tail -1 | sed -E 's/^\[ *([0-9]+)\.([0-9]{6}).*/\1\2/')
+    ap=$(systemctl show "hostapd@$IF" -p ActiveEnterTimestampMonotonic --value 2>/dev/null)
+    if [ -n "$DEV" ] && [ -n "$fw" ] && [ "${ap:-0}" -gt 0 ] && [ "$fw" -gt "$ap" ]; then
+      logger -t ap-watchdog "$IF: mac reset detected - restarting hostapd@$IF"
+      echo "$now" > "$STAMP"
+      systemctl restart "hostapd@$IF"
+      continue
+    fi
+  fi
+
+  # --- mode 2: per-station rate collapse -> deauth just that station ---
+  #
+  # Only a collapse on the direction that is actually carrying traffic matters.
+  # "tx bitrate" is the AP->client rate. A camera sends its video client->AP, so
+  # its AP->client direction carries nothing but TCP ACKs - tens of kbps, which a
+  # 6.5 Mbit link carries with ~160x headroom. Deauthenticating a camera for a low
+  # AP->client rate kills a healthy stream to fix a link that was never a problem.
+  # So measure AP->client throughput between runs and only act when the station
+  # is genuinely receiving (> 1 Mbps). It must also be active, and the condition
+  # must hold for two checks.
+  iw dev "$IF" station dump 2>/dev/null | awk "
+    /^Station/        {mac=\$2}
+    /inactive time:/  {inact=\$3}
+    /tx bytes:/       {txb=\$3}
+    /signal:/         {sig=\$2}
+    /tx bitrate:/     {print mac, sig, \$3, inact, txb}
+  " | while read -r mac sig rate inact txb; do
+    [ -z "$mac" ] && continue
+    S="$RUNDIR/$(echo "$mac" | tr : _)"
+    rate_int=${rate%%.*}
+
+    demand=0
+    if [ -f "$S.txb" ]; then
+      read -r prev_txb prev_t < "$S.txb"
+      dt=$(( now - prev_t ))
+      if [ "$dt" -gt 0 ] && [ "$txb" -ge "$prev_txb" ] 2>/dev/null; then
+        demand=$(( (txb - prev_txb) * 8 * 100 / dt / 1000000 ))
+      fi
+    fi
+    echo "$txb $now" > "$S.txb"
+
+    healthy_signal=$([ "$sig" -gt -70 ] 2>/dev/null && echo 1 || echo 0)
+    floor_rate=$([ "$rate_int" -le 14 ] 2>/dev/null && echo 1 || echo 0)
+    active=$([ "$inact" -lt 1000 ] 2>/dev/null && echo 1 || echo 0)
+    receiving=$([ "$demand" -ge "$MIN_RX_MBPS_X100" ] && echo 1 || echo 0)
+
+    if [ "$healthy_signal$floor_rate$active$receiving" != "1111" ]; then
+      rm -f "$S.strike"
+      continue
+    fi
+    if [ ! -f "$S.strike" ]; then
+      echo "$now" > "$S.strike"
+      logger -t ap-watchdog "$IF: station $mac at ${rate} Mbit / ${sig} dBm while receiving $((demand/100)).$((demand%100)) Mbps - first strike, watching"
+      continue
+    fi
+    if [ -f "$S.last" ] && [ $(( now - $(cat "$S.last") )) -lt 120 ]; then
+      continue
+    fi
+    logger -t ap-watchdog "$IF: station $mac stuck at ${rate} Mbit at ${sig} dBm while receiving $((demand/100)).$((demand%100)) Mbps (2 checks) - deauthenticating"
+    echo "$now" > "$S.last"
+    rm -f "$S.strike"
+    hostapd_cli -i "$IF" deauthenticate "$mac" >/dev/null 2>&1
+  done
+done

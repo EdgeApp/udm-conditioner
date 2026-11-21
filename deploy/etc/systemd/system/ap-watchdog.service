@@ -1,0 +1,5 @@
+[Unit]
+Description=Recover the AP after an mt7921u MAC reset
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ap-watchdog.sh

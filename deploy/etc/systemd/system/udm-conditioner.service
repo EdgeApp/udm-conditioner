@@ -1,0 +1,17 @@
+[Unit]
+Description=Raspberry Pi network conditioner
+After=network-online.target hostapd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/udm-conditioner
+ExecStart=/usr/bin/node /opt/udm-conditioner/lib/server/index.js
+Environment=GSC_IFACE=wlan0
+Environment=GSC_PORT=9393
+Environment=GSC_HOST=127.0.0.1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
